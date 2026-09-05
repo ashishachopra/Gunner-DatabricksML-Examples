@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Document xmlns="urn:iso:std:iso:20022:tech:xsd:pacs.008.001.08">
+  <FIToFICstmrCdtTrf>
+    <GrpHdr>
+      <MsgId>MSG20260304-001</MsgId>
+      <CreDtTm>2026-03-04T10:15:00Z</CreDtTm>
+      <NbOfTxs>1</NbOfTxs>
+      <SttlmInf>
+        <SttlmMtd>CLRG</SttlmMtd>
+      </SttlmInf>
+    </GrpHdr>
+    <CdtTrfTxInf>
+      <PmtId>
+        <InstrId>INSTR-001</InstrId>
+        <EndToEndId>E2E-REF-001</EndToEndId>
+        <TxId>TX-001</TxId>
+      </PmtId>
+      <IntrBkSttlmAmt Ccy="AUD">1500.00</IntrBkSttlmAmt>
+      <IntrBkSttlmDt>2026-03-05</IntrBkSttlmDt>
+      <CdtrAgt>
+        <FinInstnId>
+          <BICFI>CRDTAU2SXXX</BICFI>
+        </FinInstnId>
+      </CdtrAgt>
+      <Cdtr>
+        <Nm>John Smith</Nm>
+      </Cdtr>
+      <CdtrAcct>
+        <Id>
+          <IBAN>AU123456789012345678</IBAN>
+        </Id>
+      </CdtrAcct>
+      <DbtrAgt>
+        <FinInstnId>
+          <BICFI>DBTTAU2SXXX</BICFI>
+        </FinInstnId>
+      </DbtrAgt>
+      <Dbtr>
+        <Nm>Jane Doe</Nm>
+      </Dbtr>
+      <DbtrAcct>
+        <Id>
+          <IBAN>AU987654321098765432</IBAN>
+        </Id>
+      </DbtrAcct>
+    </CdtTrfTxInf>
+  </FIToFICstmrCdtTrf>
+</Document>
