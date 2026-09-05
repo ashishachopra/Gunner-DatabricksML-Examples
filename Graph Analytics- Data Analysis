@@ -1,0 +1,187 @@
+import plotly.express as px
+from pyspark.sql.types import DoubleType
+import pyspark.sql.functions as F
+from pyspark.sql import Window
+import requests
+import pandas as pd
+from io import StringIO
+import re
+catalog = "main"
+db_name = "telco"
+#Dataset under apache license: https://github.com/IBM/telco-customer-churn-on-icp4d/blob/master/LICENSE
+cust_csv = requests.get("https://raw.githubusercontent.com/IBM/telco-customer-churn-on-icp4d/master/data/Telco-Customer-Churn.csv").text
+cust_df = pd.read_csv(StringIO(cust_csv), sep=",")
+ 
+def cleanup_column(pdf):
+  # Clean up column names
+  pdf.columns = [re.sub(r'(?<!^)(?=[A-Z])', '_', name).lower().replace("__", "_") for name in pdf.columns]
+  pdf.columns = [re.sub(r'[\(\)]', '', name).lower() for name in pdf.columns]
+  pdf.columns = [re.sub(r'[ -]', '_', name).lower() for name in pdf.columns]
+  return pdf.rename(columns = {'streaming_t_v': 'streaming_tv', 'customer_i_d': 'customer_id'})
+  
+cust_df = cleanup_column(cust_df)
+ 
+mobile_csv = requests.get("https://raw.githubusercontent.com/databricks-industry-solutions/graph-analytics-churn-prediction/main/data/telco_customer_mobile.csv").text 
+mobile_df = pd.read_csv(StringIO(mobile_csv), sep=",")
+ 
+df = cust_df.merge(mobile_df, on='customer_id', how='left')
+df = df[['customer_id', 'gender', 'senior_citizen', 'partner', 'dependents',
+       'tenure', 'phone_service', 'multiple_lines', 'internet_service',
+       'online_security', 'online_backup', 'device_protection', 'tech_support',
+       'streaming_tv', 'streaming_movies', 'contract', 'paperless_billing',
+       'payment_method', 'monthly_charges', 'total_charges', 'mobile_number', 'churn']]
+spark.createDataFrame(df).write.mode("overwrite").option("overwriteSchema", "true").saveAsTable(f"{catalog}.{db_name}.telco_churn_customers_bronze")
+call_csv = requests.get("https://raw.githubusercontent.com/databricks-industry-solutions/graph-analytics-churn-prediction/main/data/telco_call_log.csv").text
+call_df = pd.read_csv(StringIO(call_csv), sep=",")
+call_df = call_df[['datatime', 'caller_mobile_number', 'callee_mobile_number', 'duration']]
+spark.createDataFrame(call_df).write.mode("overwrite").option("overwriteSchema", "true").saveAsTable(f"{catalog}.{db_name}.telco_call_log_bronze")
+# Read customer data into Spark
+customer_df = spark.table(f"{catalog}.{db_name}.telco_churn_customers_bronze")
+display(customer_df)
+display(customer_df)
+display(call_df)
+# Clean and cast total_charges - replace spaces with null using CASE WHEN
+customer_df = customer_df.withColumn(
+    "total_charges",
+    F.expr("CASE WHEN trim(total_charges) = '' THEN NULL ELSE CAST(total_charges AS DOUBLE) END")
+)
+
+call_df = spark.createDataFrame(call_df).withColumn("datatime", F.to_timestamp("datatime"))
+sampled_df = customer_df.toPandas().sample(n=10000, replace=True, random_state=123).sort_index()
+sampled_df['payment_method'] = sampled_df['payment_method'].astype(str)
+
+sampled_df['churn'] = sampled_df['churn'].astype(str)
+fig = px.histogram(sampled_df, x='payment_method', color='churn')
+
+fig.update_xaxes(categoryorder='total descending')
+fig.show()
+fig = px.pie(sampled_df, names='contract')
+fig.show()
+fig = px.histogram(sampled_df, x="tenure", color="churn", 
+             color_discrete_map={'No':'orange',
+                                 'Yes':'green'})
+fig.show()
+vertex_df = customer_df.withColumnRenamed('customer_id', 'id')
+display(vertex_df)
+edge_df = call_df.alias('call').join(customer_df.alias('customer'), call_df.caller_mobile_number==customer_df.mobile_number, how='left')\
+                 .select('customer.customer_id','call.callee_mobile_number')\
+                 .withColumnRenamed('customer_id','src')
+edge_df = edge_df.alias('call').join(customer_df.alias('customer'), call_df.callee_mobile_number==customer_df.mobile_number, how='left')\
+                 .select('customer.customer_id','call.src')\
+                 .withColumnRenamed('customer_id','dst')
+edge_df = edge_df.dropDuplicates()
+display(edge_df)
+# Calculate degree (number of connections) using native PySpark
+# Degree = count of incoming edges (dst) + outgoing edges (src)
+
+# Count outgoing edges (as source)
+out_degree = edge_df.groupBy(F.col("src").alias("id")).agg(F.count("*").alias("out_degree"))
+
+# Count incoming edges (as destination)
+in_degree = edge_df.groupBy(F.col("dst").alias("id")).agg(F.count("*").alias("in_degree"))
+
+# Combine to get total degree (undirected graph)
+degrees = out_degree.join(in_degree, "id", "full_outer") \
+    .fillna(0, ["out_degree", "in_degree"]) \
+    .withColumn("degree", F.col("out_degree") + F.col("in_degree")) \
+    .select("id", "degree") \
+    .orderBy(F.desc("degree"))
+
+display(degrees)
+# Find connected components using iterative joins (native PySpark)
+# Simplified for serverless compute (no caching)
+
+# Initialize: each vertex has its own ID as component
+components = vertex_df.select(F.col("id").alias("vertex"), F.col("id").alias("component"))
+
+# Create bidirectional edges for undirected graph
+bidirectional_edges = edge_df.select("src", "dst").union(
+    edge_df.select(F.col("dst").alias("src"), F.col("src").alias("dst"))
+)
+
+# Iteratively propagate minimum component ID through edges
+for iteration in range(5):
+    # Propagate component IDs through edges
+    propagated = bidirectional_edges.join(
+        components,
+        bidirectional_edges.src == components.vertex,
+        "inner"
+    ).select(
+        F.col("dst").alias("vertex"),
+        F.col("component")
+    )
+    
+    # Combine with existing components and take minimum
+    new_components = components.union(propagated) \
+        .groupBy("vertex") \
+        .agg(F.min("component").alias("component"))
+    
+    # Simple convergence check: count distinct component values
+    old_distinct = components.select("component").distinct().count()
+    new_distinct = new_components.select("component").distinct().count()
+    
+    components = new_components
+    
+    if old_distinct == new_distinct:
+        print(f"Converged after {iteration + 1} iterations")
+        break
+
+print(f"Final components: {components.select('component').distinct().count()}")
+
+# Join back with vertex attributes
+result = vertex_df.join(components, vertex_df.id == components.vertex, "left") \
+    .drop("vertex")
+
+display(result)
+# Label Propagation for community detection (native PySpark)
+# Simplified for serverless compute
+
+# Initialize: each vertex has its own ID as label
+labels = vertex_df.select(F.col("id").alias("vertex"), F.col("id").alias("label"))
+
+# Create bidirectional edges for undirected graph
+bidirectional_edges = edge_df.select("src", "dst").union(
+    edge_df.select(F.col("dst").alias("src"), F.col("src").alias("dst"))
+)
+
+maxIter = 3  # Reduced iterations for performance
+for iteration in range(maxIter):
+    # Get labels of neighbors
+    neighbor_labels = bidirectional_edges.join(
+        labels,
+        bidirectional_edges.dst == labels.vertex,
+        "inner"
+    ).select(
+        F.col("src").alias("vertex"),
+        F.col("label").alias("neighbor_label")
+    )
+    
+    # Count frequency of each label for each vertex
+    label_counts = neighbor_labels.groupBy("vertex", "neighbor_label") \
+        .agg(F.count("*").alias("count"))
+    
+    # Select most frequent label (with tie-breaking by min label)
+    window = Window.partitionBy("vertex").orderBy(F.desc("count"), F.asc("neighbor_label"))
+    new_labels = label_counts.withColumn("rank", F.row_number().over(window)) \
+        .filter(F.col("rank") == 1) \
+        .select(F.col("vertex"), F.col("neighbor_label").alias("label"))
+    
+    # Keep vertices that had no neighbors with their original label
+    new_labels = new_labels.union(
+        labels.join(new_labels, "vertex", "left_anti")
+    )
+    
+    labels = new_labels
+
+print(f"Label propagation completed after {maxIter} iterations")
+print(f"Unique labels: {labels.select('label').distinct().count()}")
+
+# Join back with vertex attributes
+result = vertex_df.join(labels, vertex_df.id == labels.vertex, "left") \
+    .drop("vertex")
+
+display(result)
+customer_df.write.mode("overwrite").option("overwriteSchema", "true").saveAsTable(f"{catalog}.{db_name}.telco_churn_customers_silver")
+call_df.write.mode("overwrite").option("overwriteSchema", "true").saveAsTable(f"{catalog}.{db_name}.telco_call_log_silver")
+vertex_df.write.mode("overwrite").option("overwriteSchema", "true").saveAsTable(f"{catalog}.{db_name}.telco_vertex_df")
+edge_df.write.mode("overwrite").option("overwriteSchema", "true").saveAsTable(f"{catalog}.{db_name}.telco_edge_df")
